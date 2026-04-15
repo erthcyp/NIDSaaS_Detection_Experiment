@@ -1,0 +1,14 @@
+# Core data / ML
+numpy
+pandas
+scipy
+scikit-learn
+joblib
+
+# Plotting
+matplotlib
+
+# Deep learning (only needed if LSTM path is used)
+torch
+torchvision
+torchaudio
