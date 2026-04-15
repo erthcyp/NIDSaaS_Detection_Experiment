@@ -4,14 +4,13 @@ import argparse
 import time
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import pandas as pd
 
 from config import DataConfig, ExperimentConfig
 from load_data import load_and_prepare_detection_data
 from metrics import binary_metrics, class_wise_detection
 from rf_anomaly import SelfSupervisedRFAnomaly
-from utils import make_dir, set_random_seed, write_json
+from utils import set_random_seed, write_json
 
 
 MODEL_NAME_MAP = {
@@ -20,13 +19,26 @@ MODEL_NAME_MAP = {
     "lstm": "LSTM",
     "hybrid": "Hybrid",
 }
+
+
 def log(msg: str) -> None:
     print(f"[main_detection] {msg}", flush=True)
 
 
 def save_bar_plot(metrics_df: pd.DataFrame, out_path: Path) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        log("matplotlib is not installed; skipping detection_performance.png")
+        return
+
     metric_order = ["accuracy", "precision", "recall", "f1"]
-    plot_df = metrics_df.set_index("paper_model")[metric_order]
+    usable = [c for c in metric_order if c in metrics_df.columns]
+    if not usable:
+        log("no plot metrics available; skipping detection_performance.png")
+        return
+
+    plot_df = metrics_df.set_index("paper_model")[usable]
     ax = plot_df.plot(kind="bar", figsize=(9, 5))
     ax.set_ylabel("Score")
     ax.set_xlabel("Model")
@@ -36,16 +48,35 @@ def save_bar_plot(metrics_df: pd.DataFrame, out_path: Path) -> None:
     plt.tight_layout()
     plt.savefig(out_path, dpi=200)
     plt.close()
+    log(f"saved plot: {out_path}")
+
+
+def save_prediction_csv(
+    base_df: pd.DataFrame,
+    pred_name: str,
+    pred_values,
+    out_path: Path,
+    score_name: str | None = None,
+    score_values=None,
+) -> None:
+    pred_df = base_df.copy()
+    pred_df[pred_name] = pred_values
+    if score_name is not None and score_values is not None:
+        pred_df[score_name] = score_values
+    pred_df.to_csv(out_path, index=False)
+    log(f"saved predictions: {out_path}")
 
 
 def run_experiment(config: ExperimentConfig, mode: str = "all") -> None:
     out_dir = Path(config.data.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
     log(f"ensured output directory exists: {out_dir.resolve()}")
     set_random_seed(config.data.random_state)
     log(f"output_dir={out_dir}")
     log(f"seed={config.data.random_state}")
     log(f"mode={mode}")
+
     log("loading and preparing data ...")
     cleaned_df, splits = load_and_prepare_detection_data(
         config.data.data_dir,
@@ -55,14 +86,15 @@ def run_experiment(config: ExperimentConfig, mode: str = "all") -> None:
         random_state=config.data.random_state,
         drop_unknown_labels=config.data.drop_unknown_labels,
     )
+
     log(
-    "data ready: "
-    f"cleaned={len(cleaned_df):,}, "
-    f"train={len(splits.train_all):,}, "
-    f"val={len(splits.val_all):,}, "
-    f"test={len(splits.test_all):,}, "
-    f"train_benign={len(splits.train_benign):,}, "
-    f"val_benign={len(splits.val_benign):,}"
+        "data ready: "
+        f"cleaned={len(cleaned_df):,}, "
+        f"train={len(splits.train_all):,}, "
+        f"val={len(splits.val_all):,}, "
+        f"test={len(splits.test_all):,}, "
+        f"train_benign={len(splits.train_benign):,}, "
+        f"val_benign={len(splits.val_benign):,}"
     )
 
     results = []
@@ -70,39 +102,60 @@ def run_experiment(config: ExperimentConfig, mode: str = "all") -> None:
 
     y_test = splits.test_all["binary_label"].to_numpy()
     multiclass_test = splits.test_all["multiclass_label"]
-    
-    
+
     if mode in {"all", "signature", "hybrid"}:
         from signature import SignaturePrefilter
+
         log("running signature prefilter ...")
         t0 = time.perf_counter()
+
         sig = SignaturePrefilter(config.signature)
         y_sig, sig_rule_hits = sig.predict(splits.test_all)
+
         elapsed = time.perf_counter() - t0
         sig_metrics = binary_metrics(y_test, y_sig)
-        sig_metrics.update({"model": "signature", "paper_model": MODEL_NAME_MAP["signature"], "total_time_s": elapsed})
+        sig_metrics.update(
+            {
+                "model": "signature",
+                "paper_model": MODEL_NAME_MAP["signature"],
+                "total_time_s": elapsed,
+            }
+        )
         results.append(sig_metrics)
         pred_cache["signature"] = pd.Series(y_sig)
+
+        save_prediction_csv(
+            splits.test_all,
+            pred_name="signature_pred",
+            pred_values=y_sig,
+            out_path=out_dir / "signature_predictions.csv",
+        )
+
         sig_rule_hits.to_csv(out_dir / "signature_rule_hits_test.csv", index=False)
         sig_rule_hits.sum().rename("hit_count").to_csv(out_dir / "signature_rule_summary.csv", header=True)
         write_json(sig.get_params(), out_dir / "signature_config.json")
         log(f"signature done in {elapsed:.2f}s")
-        
+
     if mode in {"all", "rf", "hybrid"}:
         log("running RF anomaly detector ...")
         t0 = time.perf_counter()
+
         rf_model = SelfSupervisedRFAnomaly(config.rf).fit(
             splits.train_benign,
             splits.val_benign,
             random_state=config.data.random_state,
         )
         y_rf, rf_scores = rf_model.predict(splits.test_all)
-        rf_pred_df = splits.test_all.copy()
-        rf_pred_df["rf_pred"] = y_rf
-        rf_pred_df["rf_score"] = rf_scores
-        rf_pred_df.to_csv(out_dir / "rf_predictions.csv", index=False)
-        log(f"saved RF predictions: {out_dir / 'rf_predictions.csv'}")
-        
+
+        save_prediction_csv(
+            splits.test_all,
+            pred_name="rf_pred",
+            pred_values=y_rf,
+            score_name="rf_score",
+            score_values=rf_scores,
+            out_path=out_dir / "rf_predictions.csv",
+        )
+
         elapsed = time.perf_counter() - t0
         rf_metrics = binary_metrics(y_test, y_rf, scores=rf_scores)
         rf_metrics.update(
@@ -117,6 +170,7 @@ def run_experiment(config: ExperimentConfig, mode: str = "all") -> None:
         results.append(rf_metrics)
         pred_cache["rf"] = pd.Series(y_rf)
         rf_model.save(out_dir / "rf_anomaly.joblib")
+
         log(
             f"rf done in {elapsed:.2f}s | "
             f"threshold={rf_model.threshold:.6f} | "
@@ -125,14 +179,26 @@ def run_experiment(config: ExperimentConfig, mode: str = "all") -> None:
 
     if mode in {"all", "lstm"}:
         from lstm_anomaly import LSTMAnomalyDetector
+
         log("running LSTM anomaly detector ...")
         t0 = time.perf_counter()
+
         lstm_model = LSTMAnomalyDetector(config.lstm).fit(
             splits.train_benign,
             splits.val_benign,
             random_state=config.data.random_state,
         )
         y_lstm, lstm_scores = lstm_model.predict(splits.test_all)
+
+        save_prediction_csv(
+            splits.test_all,
+            pred_name="lstm_pred",
+            pred_values=y_lstm,
+            score_name="lstm_score",
+            score_values=lstm_scores,
+            out_path=out_dir / "lstm_predictions.csv",
+        )
+
         elapsed = time.perf_counter() - t0
         lstm_metrics = binary_metrics(y_test, y_lstm, scores=lstm_scores)
         lstm_metrics.update(
@@ -147,6 +213,7 @@ def run_experiment(config: ExperimentConfig, mode: str = "all") -> None:
         results.append(lstm_metrics)
         pred_cache["lstm"] = pd.Series(y_lstm)
         lstm_model.save(out_dir / "lstm_anomaly.joblib")
+
         log(
             f"lstm done in {elapsed:.2f}s | "
             f"threshold={lstm_model.threshold:.6f} | "
@@ -154,14 +221,31 @@ def run_experiment(config: ExperimentConfig, mode: str = "all") -> None:
         )
 
     if mode in {"all", "hybrid"}:
+        from hybrid import or_hybrid
+
         log("running hybrid OR merge ...")
         if "signature" not in pred_cache or "rf" not in pred_cache:
             raise RuntimeError("Hybrid mode requires signature and rf predictions.")
+
         t0 = time.perf_counter()
         y_hybrid = or_hybrid(pred_cache["signature"].to_numpy(), pred_cache["rf"].to_numpy())
         elapsed = time.perf_counter() - t0
+
+        save_prediction_csv(
+            splits.test_all,
+            pred_name="hybrid_pred",
+            pred_values=y_hybrid,
+            out_path=out_dir / "hybrid_predictions.csv",
+        )
+
         hy_metrics = binary_metrics(y_test, y_hybrid)
-        hy_metrics.update({"model": "hybrid", "paper_model": MODEL_NAME_MAP["hybrid"], "total_time_s": elapsed})
+        hy_metrics.update(
+            {
+                "model": "hybrid",
+                "paper_model": MODEL_NAME_MAP["hybrid"],
+                "total_time_s": elapsed,
+            }
+        )
         results.append(hy_metrics)
         pred_cache["hybrid"] = pd.Series(y_hybrid)
 
@@ -171,10 +255,25 @@ def run_experiment(config: ExperimentConfig, mode: str = "all") -> None:
 
     metrics_df = pd.DataFrame(results)
     column_order = [
-        "paper_model", "model", "accuracy", "precision", "recall", "f1", "far",
-        "roc_auc", "pr_auc", "tp", "tn", "fp", "fn", "threshold", "derived_threshold", "total_time_s",
+        "paper_model",
+        "model",
+        "accuracy",
+        "precision",
+        "recall",
+        "f1",
+        "far",
+        "roc_auc",
+        "pr_auc",
+        "tp",
+        "tn",
+        "fp",
+        "fn",
+        "threshold",
+        "derived_threshold",
+        "total_time_s",
     ]
     metrics_df = metrics_df[[c for c in column_order if c in metrics_df.columns]]
+
     log("saving outputs ...")
     metrics_df.to_csv(out_dir / "overall_metrics.csv", index=False)
     save_bar_plot(metrics_df, out_dir / "detection_performance.png")
