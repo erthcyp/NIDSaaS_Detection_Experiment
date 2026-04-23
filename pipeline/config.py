@@ -19,43 +19,20 @@ class DataConfig:
     drop_unknown_labels: bool = True
     save_split_indices: bool = True
 
-
-@dataclass
-class SignatureConfig:
-    scan_window_seconds: float = 2.0
-    scan_min_unique_dst_ports: int = 20
-    scan_min_flows: int = 20
-    ddos_min_packets_per_sec: float = 20_000.0
-    ddos_min_bytes_per_sec: float = 10_000_000.0
-    syn_flood_min_syn_flags: float = 10.0
-    syn_flood_max_backward_packets: float = 2.0
-    http_flood_min_packets_per_sec: float = 5_000.0
-    http_flood_min_fwd_packets: float = 20.0
-    slow_http_min_duration_us: float = 2_000_000.0
-    slow_http_max_packets_per_sec: float = 5.0
-    slow_http_max_bytes_per_sec: float = 2_000.0
-    brute_force_min_syn_flags: float = 3.0
-    brute_force_min_fwd_packets: float = 10.0
-    rst_anomaly_min_rst_flags: float = 5.0
-
-
 @dataclass
 class RFConfig:
     n_svd_components: int = 64
-    n_rff_components: int = 128
+    n_rff_components: int = 192
     rff_gamma: float = 0.10
-    n_rotations: int = 12
+    n_rotations: int = 8
 
-    # ขยับ model capacity ขึ้น
-    n_estimators: int = 100
+    n_estimators: int = 200
     max_depth: Optional[int] = 20
-    min_samples_leaf: int = 3
-    n_jobs: int = -1
+    min_samples_leaf: int = 2
+    n_jobs: int = 8
 
-    threshold_quantile: float = 0.95
+    threshold_quantile: float = 0.97
     calibrated_threshold: Optional[float] = 0.8042
-
-    # ใช้ threshold ที่ derive จาก validation ของรอบนี้
     use_calibrated_threshold: bool = False
 
     exclude_columns: Tuple[str, ...] = (
@@ -104,6 +81,5 @@ class LSTMConfig:
 @dataclass
 class ExperimentConfig:
     data: DataConfig
-    signature: SignatureConfig = field(default_factory=SignatureConfig)
     rf: RFConfig = field(default_factory=RFConfig)
     lstm: LSTMConfig = field(default_factory=LSTMConfig)

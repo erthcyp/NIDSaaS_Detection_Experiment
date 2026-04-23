@@ -121,31 +121,124 @@ def _sort_for_sequences(df: pd.DataFrame) -> pd.DataFrame:
     return df.sort_values("row_id")
 
 
+def _time_series_for_df(df: pd.DataFrame) -> pd.Series:
+    """Return a sortable per-row time key for temporal splits.
+
+    Falls back to row_id (or enumerate) when no timestamp column is available,
+    so splits remain deterministic but still honor ingestion order.
+    """
+    for col in ("timestamp", "Timestamp"):
+        if col in df.columns:
+            ts = pd.to_datetime(df[col], errors="coerce")
+            if ts.notna().any():
+                return ts
+    if "row_id" in df.columns:
+        return pd.Series(df["row_id"].to_numpy(), index=df.index)
+    return pd.Series(np.arange(len(df)), index=df.index)
+
+
+def _time_split_positions(
+    n: int,
+    test_size: float,
+    val_size_from_train: float,
+    time_rank: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Split n rows ordered by time_rank into (train, val, test) by chronology.
+
+    Proportions mirror the existing random splitter:
+        test  = last test_size fraction
+        val   = last val_size_from_train fraction of the remaining head
+        train = everything before val
+    """
+    n_test = int(round(n * test_size))
+    n_remain = n - n_test
+    n_val = int(round(n_remain * val_size_from_train))
+    n_train = n_remain - n_val
+    order = np.argsort(time_rank, kind="stable")
+    train_pos = order[:n_train]
+    val_pos = order[n_train : n_train + n_val]
+    test_pos = order[n_train + n_val :]
+    return train_pos, val_pos, test_pos
+
+
 def split_detection_data(
     df: pd.DataFrame,
     test_size: float = 0.20,
     val_size_from_train: float = 0.20,
     random_state: int = 42,
+    split_strategy: str = "random",
 ) -> DetectionSplits:
-    train_df, test_df = train_test_split(
-        df,
-        test_size=test_size,
-        stratify=df["binary_label"],
-        random_state=random_state,
-    )
+    """Split into train/val/test.
 
-    train_df, val_df = train_test_split(
-        train_df,
-        test_size=val_size_from_train,
-        stratify=train_df["binary_label"],
-        random_state=random_state,
-    )
+    split_strategy:
+      * "random"           - stratified random split (original behaviour).
+      * "temporal"         - single global chronological split; train has the
+                             earliest rows, test has the latest.
+      * "temporal_by_file" - within each source_file / day, take first 64%
+                             rows as train, next 16% as val, last 20% as test.
+                             Preserves within-day order while keeping each
+                             attack class present in every split. Recommended
+                             for CIC-IDS2017 evaluations.
+    """
+    strategy = split_strategy.lower()
+
+    if strategy == "random":
+        train_df, test_df = train_test_split(
+            df,
+            test_size=test_size,
+            stratify=df["binary_label"],
+            random_state=random_state,
+        )
+        train_df, val_df = train_test_split(
+            train_df,
+            test_size=val_size_from_train,
+            stratify=train_df["binary_label"],
+            random_state=random_state,
+        )
+
+    elif strategy == "temporal":
+        ts = _time_series_for_df(df)
+        time_rank = ts.rank(method="first", na_option="bottom").to_numpy()
+        tr_pos, va_pos, te_pos = _time_split_positions(
+            len(df), test_size, val_size_from_train, time_rank
+        )
+        train_df = df.iloc[tr_pos]
+        val_df = df.iloc[va_pos]
+        test_df = df.iloc[te_pos]
+
+    elif strategy == "temporal_by_file":
+        if "source_file" not in df.columns:
+            raise ValueError(
+                "split_strategy='temporal_by_file' requires a 'source_file' column."
+            )
+        ts_full = _time_series_for_df(df)
+        tr_parts: list[pd.DataFrame] = []
+        va_parts: list[pd.DataFrame] = []
+        te_parts: list[pd.DataFrame] = []
+        for fname, sub in df.groupby("source_file", sort=False):
+            sub_ts = ts_full.loc[sub.index]
+            time_rank = sub_ts.rank(method="first", na_option="bottom").to_numpy()
+            tr_pos, va_pos, te_pos = _time_split_positions(
+                len(sub), test_size, val_size_from_train, time_rank
+            )
+            tr_parts.append(sub.iloc[tr_pos])
+            va_parts.append(sub.iloc[va_pos])
+            te_parts.append(sub.iloc[te_pos])
+        train_df = pd.concat(tr_parts, axis=0) if tr_parts else df.iloc[0:0]
+        val_df = pd.concat(va_parts, axis=0) if va_parts else df.iloc[0:0]
+        test_df = pd.concat(te_parts, axis=0) if te_parts else df.iloc[0:0]
+
+    else:
+        raise ValueError(
+            f"unknown split_strategy={split_strategy!r}; "
+            "expected 'random', 'temporal', or 'temporal_by_file'."
+        )
 
     train_df = train_df.reset_index(drop=True)
     val_df = val_df.reset_index(drop=True)
     test_df = test_df.reset_index(drop=True)
     log(
-        f"split sizes | train={len(train_df):,}, "
+        f"split sizes [{strategy}] | train={len(train_df):,}, "
         f"val={len(val_df):,}, test={len(test_df):,}"
     )
 
@@ -171,6 +264,7 @@ def load_and_prepare_detection_data(
     val_size_from_train: float = 0.20,
     random_state: int = 42,
     drop_unknown_labels: bool = True,
+    split_strategy: str = "random",
 ) -> tuple[pd.DataFrame, DetectionSplits]:
     raw = read_cic_ids2017_folder(data_dir)
     cleaned = clean_detection_dataframe(
@@ -183,5 +277,6 @@ def load_and_prepare_detection_data(
         test_size=test_size,
         val_size_from_train=val_size_from_train,
         random_state=random_state,
+        split_strategy=split_strategy,
     )
     return cleaned, splits

@@ -64,13 +64,20 @@ class SelfSupervisedRFAnomaly:
         return x.astype(np.float32)
 
     def _build_self_supervised_dataset(self, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        xs = []
-        ys = []
+        n = x.shape[0]
+        d = x.shape[1]
+        m = len(self.rotations)
+
+        xs = np.empty((n * m, d), dtype=np.float32)
+        ys = np.empty(n * m, dtype=np.int64)
+
         for class_idx, rot in enumerate(self.rotations):
-            x_rot = x @ rot
-            xs.append(x_rot)
-            ys.append(np.full(x.shape[0], class_idx, dtype=np.int64))
-        return np.vstack(xs), np.concatenate(ys)
+            start = class_idx * n
+            end = (class_idx + 1) * n
+            xs[start:end] = x @ rot
+            ys[start:end] = class_idx
+
+        return xs, ys
 
     def fit(
         self,
@@ -85,8 +92,8 @@ class SelfSupervisedRFAnomaly:
         )
 
         # Downsample first so local training finishes in a reasonable time.
-        max_train_benign = 300_000
-        max_val_benign = 80_000
+        max_train_benign = 450_000
+        max_val_benign = 120_000
 
         if len(train_benign_df) > max_train_benign:
             train_benign_df = (
@@ -111,18 +118,18 @@ class SelfSupervisedRFAnomaly:
         log(f"selected {len(self.feature_columns)} feature columns")
 
         self.preprocessor = build_tabular_preprocessor(
-            train_benign_df,
-            feature_columns=self.feature_columns,
-            scale_numeric=True,
-        )
+                train_benign_df,
+                feature_columns=self.feature_columns,
+                scale_numeric=True,
+            )
 
         x_train_base = self.preprocessor.fit_transform(train_benign_df[self.feature_columns])
-        x_train_base = self._to_dense(x_train_base)
+        x_train_base = self._to_dense(x_train_base).astype(np.float32, copy=False)
         log(f"preprocessed train shape={x_train_base.shape}")
 
         n_svd = min(self.config.n_svd_components, max(2, x_train_base.shape[1] - 1))
         self.svd = TruncatedSVD(n_components=n_svd, random_state=random_state)
-        x_train_svd = self.svd.fit_transform(x_train_base)
+        x_train_svd = self.svd.fit_transform(x_train_base).astype(np.float32, copy=False)
         log(f"after SVD shape={x_train_svd.shape}")
 
         self.rff = RBFSampler(
@@ -130,7 +137,7 @@ class SelfSupervisedRFAnomaly:
             n_components=self.config.n_rff_components,
             random_state=random_state,
         )
-        x_train_rff = self.rff.fit_transform(x_train_svd).astype(np.float32)
+        x_train_rff = self.rff.fit_transform(x_train_svd).astype(np.float32, copy=False)
         log(f"after RFF shape={x_train_rff.shape}")
 
         self.rotations = self._make_rotations(x_train_rff.shape[1], seed=random_state)
@@ -195,13 +202,14 @@ class SelfSupervisedRFAnomaly:
         x = self._apply_transform_chain(df)
         log(f"scoring {len(df):,} rows ...")
 
-        class_probs: list[np.ndarray] = []
+        normality_sum = np.zeros(x.shape[0], dtype=np.float32)
+
         for class_idx, rot in enumerate(self.rotations):
             x_rot = x @ rot
             probs = self.rf.predict_proba(x_rot)[:, class_idx]
-            class_probs.append(probs)
+            normality_sum += probs.astype(np.float32, copy=False)
 
-        normality = np.mean(np.vstack(class_probs), axis=0)
+        normality = normality_sum / len(self.rotations)
         anomaly_scores = 1.0 - normality
         return anomaly_scores.astype(float)
 

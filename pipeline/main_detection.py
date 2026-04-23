@@ -8,16 +8,14 @@ import pandas as pd
 
 from config import DataConfig, ExperimentConfig
 from load_data import load_and_prepare_detection_data
-from metrics import binary_metrics, class_wise_detection
+from metrics import binary_metrics
 from rf_anomaly import SelfSupervisedRFAnomaly
 from utils import set_random_seed, write_json
 
 
 MODEL_NAME_MAP = {
-    "signature": "Signature",
     "rf": "RF",
     "lstm": "LSTM",
-    "hybrid": "Hybrid",
 }
 
 
@@ -98,45 +96,9 @@ def run_experiment(config: ExperimentConfig, mode: str = "all") -> None:
     )
 
     results = []
-    pred_cache: dict[str, pd.Series] = {}
-
     y_test = splits.test_all["binary_label"].to_numpy()
-    multiclass_test = splits.test_all["multiclass_label"]
 
-    if mode in {"all", "signature", "hybrid"}:
-        from signature import SignaturePrefilter
-
-        log("running signature prefilter ...")
-        t0 = time.perf_counter()
-
-        sig = SignaturePrefilter(config.signature)
-        y_sig, sig_rule_hits = sig.predict(splits.test_all)
-
-        elapsed = time.perf_counter() - t0
-        sig_metrics = binary_metrics(y_test, y_sig)
-        sig_metrics.update(
-            {
-                "model": "signature",
-                "paper_model": MODEL_NAME_MAP["signature"],
-                "total_time_s": elapsed,
-            }
-        )
-        results.append(sig_metrics)
-        pred_cache["signature"] = pd.Series(y_sig)
-
-        save_prediction_csv(
-            splits.test_all,
-            pred_name="signature_pred",
-            pred_values=y_sig,
-            out_path=out_dir / "signature_predictions.csv",
-        )
-
-        sig_rule_hits.to_csv(out_dir / "signature_rule_hits_test.csv", index=False)
-        sig_rule_hits.sum().rename("hit_count").to_csv(out_dir / "signature_rule_summary.csv", header=True)
-        write_json(sig.get_params(), out_dir / "signature_config.json")
-        log(f"signature done in {elapsed:.2f}s")
-
-    if mode in {"all", "rf", "hybrid"}:
+    if mode in {"all", "rf"}:
         log("running RF anomaly detector ...")
         t0 = time.perf_counter()
 
@@ -168,7 +130,6 @@ def run_experiment(config: ExperimentConfig, mode: str = "all") -> None:
             }
         )
         results.append(rf_metrics)
-        pred_cache["rf"] = pd.Series(y_rf)
         rf_model.save(out_dir / "rf_anomaly.joblib")
 
         log(
@@ -211,7 +172,6 @@ def run_experiment(config: ExperimentConfig, mode: str = "all") -> None:
             }
         )
         results.append(lstm_metrics)
-        pred_cache["lstm"] = pd.Series(y_lstm)
         lstm_model.save(out_dir / "lstm_anomaly.joblib")
 
         log(
@@ -219,39 +179,6 @@ def run_experiment(config: ExperimentConfig, mode: str = "all") -> None:
             f"threshold={lstm_model.threshold:.6f} | "
             f"derived_threshold={lstm_model.derived_threshold:.6f}"
         )
-
-    if mode in {"all", "hybrid"}:
-        from hybrid import or_hybrid
-
-        log("running hybrid OR merge ...")
-        if "signature" not in pred_cache or "rf" not in pred_cache:
-            raise RuntimeError("Hybrid mode requires signature and rf predictions.")
-
-        t0 = time.perf_counter()
-        y_hybrid = or_hybrid(pred_cache["signature"].to_numpy(), pred_cache["rf"].to_numpy())
-        elapsed = time.perf_counter() - t0
-
-        save_prediction_csv(
-            splits.test_all,
-            pred_name="hybrid_pred",
-            pred_values=y_hybrid,
-            out_path=out_dir / "hybrid_predictions.csv",
-        )
-
-        hy_metrics = binary_metrics(y_test, y_hybrid)
-        hy_metrics.update(
-            {
-                "model": "hybrid",
-                "paper_model": MODEL_NAME_MAP["hybrid"],
-                "total_time_s": elapsed,
-            }
-        )
-        results.append(hy_metrics)
-        pred_cache["hybrid"] = pd.Series(y_hybrid)
-
-        classwise = class_wise_detection(multiclass_test, y_hybrid)
-        classwise.to_csv(out_dir / "classwise_hybrid.csv", index=False)
-        log(f"hybrid done in {elapsed:.2f}s")
 
     metrics_df = pd.DataFrame(results)
     column_order = [
@@ -300,7 +227,8 @@ def run_experiment(config: ExperimentConfig, mode: str = "all") -> None:
         write_json(split_indices, out_dir / "split_row_ids.json")
 
     log(f"saved outputs to: {out_dir}")
-    print(metrics_df.to_string(index=False), flush=True)
+    if not metrics_df.empty:
+        print(metrics_df.to_string(index=False), flush=True)
 
 
 if __name__ == "__main__":
@@ -310,7 +238,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mode",
         default="all",
-        choices=["all", "signature", "rf", "lstm", "hybrid"],
+        choices=["all", "rf", "lstm"],
         help="Which experiment to run.",
     )
     parser.add_argument("--seed", type=int, default=42)

@@ -1,0 +1,16 @@
+class,support,metric,rate,fires
+BENIGN,2272895,Correct Benign Rate,0.9998,352
+DoS Hulk,231072,Detection Rate,0.0,0
+PortScan,158930,Detection Rate,0.0,0
+DDoS,128027,Detection Rate,0.0,0
+DoS GoldenEye,10293,Detection Rate,0.0,0
+FTP-Patator,7938,Detection Rate,0.2013,1598
+SSH-Patator,5897,Detection Rate,0.0,0
+DoS slowloris,5796,Detection Rate,0.0,0
+DoS Slowhttptest,5499,Detection Rate,0.0,0
+Bot,1966,Detection Rate,0.0,0
+Web Attack  Brute Force,1507,Detection Rate,0.0,0
+Web Attack  XSS,652,Detection Rate,0.0,0
+Infiltration,36,Detection Rate,0.0,0
+Web Attack  Sql Injection,21,Detection Rate,0.0,0
+Heartbleed,11,Detection Rate,0.0,0
