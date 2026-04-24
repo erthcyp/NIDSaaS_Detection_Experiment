@@ -170,6 +170,115 @@ def cascade_predict(
     score = np.where(snort_pred == 1, np.maximum(score, 1.0), score)
     return final, score
 
+def _to_numpy_1d(x, name: str) -> np.ndarray:
+    arr = np.asarray(x)
+    if arr.ndim != 1:
+        arr = np.ravel(arr)
+    if arr.ndim != 1:
+        raise ValueError(f"{name} must be 1-D after ravel, got shape={arr.shape}")
+    return arr
+
+
+def _build_prediction_export(
+    base_df: pd.DataFrame,
+    split_name: str,
+    rf_score,
+    rf_pvalue,
+    snort_pred,
+    snort_score,
+    gate_prob,
+    escalated,
+    cascade_pred,
+    cascade_score,
+) -> pd.DataFrame:
+    out = base_df.copy()
+
+    n = len(out)
+    cols = {
+        "rf_score": _to_numpy_1d(rf_score, "rf_score"),
+        "rf_pvalue": _to_numpy_1d(rf_pvalue, "rf_pvalue"),
+        "snort_pred": _to_numpy_1d(snort_pred, "snort_pred"),
+        "snort_score": _to_numpy_1d(snort_score, "snort_score"),
+        "gate_prob": _to_numpy_1d(gate_prob, "gate_prob"),
+        "escalated": _to_numpy_1d(escalated, "escalated"),
+        "cascade_pred": _to_numpy_1d(cascade_pred, "cascade_pred"),
+        "cascade_score": _to_numpy_1d(cascade_score, "cascade_score"),
+    }
+
+    for k, v in cols.items():
+        if len(v) != n:
+            raise ValueError(
+                f"{split_name}: column {k!r} has length {len(v):,}, expected {n:,}"
+            )
+        out[k] = v
+
+    out["split"] = split_name
+    return out
+
+
+def export_cascade_split_predictions(
+    out_dir,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    val_rf_score,
+    val_rf_pvalue,
+    val_snort_pred,
+    val_snort_score,
+    val_gate_prob,
+    val_escalated,
+    val_cascade_pred,
+    val_cascade_score,
+    test_rf_score,
+    test_rf_pvalue,
+    test_snort_pred,
+    test_snort_score,
+    test_gate_prob,
+    test_escalated,
+    test_cascade_pred,
+    test_cascade_score,
+):
+    """
+    Export validation and test prediction tables for downstream
+    validation-calibrated thresholding of the proposed method.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    val_out = _build_prediction_export(
+        base_df=val_df,
+        split_name="validation",
+        rf_score=val_rf_score,
+        rf_pvalue=val_rf_pvalue,
+        snort_pred=val_snort_pred,
+        snort_score=val_snort_score,
+        gate_prob=val_gate_prob,
+        escalated=val_escalated,
+        cascade_pred=val_cascade_pred,
+        cascade_score=val_cascade_score,
+    )
+
+    test_out = _build_prediction_export(
+        base_df=test_df,
+        split_name="test",
+        rf_score=test_rf_score,
+        rf_pvalue=test_rf_pvalue,
+        snort_pred=test_snort_pred,
+        snort_score=test_snort_score,
+        gate_prob=test_gate_prob,
+        escalated=test_escalated,
+        cascade_pred=test_cascade_pred,
+        cascade_score=test_cascade_score,
+    )
+
+    val_path = out_dir / "val_cascade_predictions.csv"
+    test_path = out_dir / "test_cascade_predictions.csv"
+
+    val_out.to_csv(val_path, index=False)
+    test_out.to_csv(test_path, index=False)
+
+    print(f"[cascade-export] wrote: {val_path}", flush=True)
+    print(f"[cascade-export] wrote: {test_path}", flush=True)
+    return val_path, test_path
 
 def run_cascade(
     data_dir: str,
@@ -302,7 +411,51 @@ def run_cascade(
         alpha_escalate=alpha_escalate,
         gate_threshold=gate_threshold,
     )
+    # ------------------------------------------------------------
+    # Export split-specific prediction tables for proposed val-cal
+    # ------------------------------------------------------------
+    val_snort_pred = gate_val_merged["snort_pred"].to_numpy()
+    val_snort_score = gate_val_merged["snort_score"].to_numpy()
 
+    gate_probs_val = np.zeros(len(gate_val_pvals), dtype=float)
+    if n_esc > 0:
+        sub_val_df = gate_val_df.loc[escalation_mask_val].reset_index(drop=True)
+        sub_val_meta = gate_val_meta.loc[escalation_mask_val].reset_index(drop=True)
+        gate_probs_val[escalation_mask_val] = gate.predict_proba(sub_val_df, sub_val_meta)
+
+    val_final_pred, val_cascade_score = cascade_predict(
+        rf_score=gate_val_scores,
+        rf_pvalue=gate_val_pvals,
+        snort_pred=val_snort_pred,
+        gate_prob=gate_probs_val,
+        alpha_escalate=alpha_escalate,
+        gate_threshold=gate_threshold,
+    )
+
+    val_rf_pred = (gate_val_scores > rf_model.threshold).astype(int)
+    val_conformal_pred = (gate_val_pvals <= alpha_conformal).astype(int)
+
+    val_csv_path, test_csv_path = export_cascade_split_predictions(
+        out_dir=out,
+        val_df=gate_val_df,
+        test_df=splits.test_all,
+        val_rf_score=gate_val_scores,
+        val_rf_pvalue=gate_val_pvals,
+        val_snort_pred=val_snort_pred,
+        val_snort_score=val_snort_score,
+        val_gate_prob=gate_probs_val,
+        val_escalated=escalation_mask_val.astype(int),
+        val_cascade_pred=val_final_pred,
+        val_cascade_score=val_cascade_score,
+        test_rf_score=test_scores,
+        test_rf_pvalue=test_pvals,
+        test_snort_pred=test_snort_pred,
+        test_snort_score=test_snort_score,
+        test_gate_prob=gate_probs_test,
+        test_escalated=escalation_mask_test.astype(int),
+        test_cascade_pred=final_pred,
+        test_cascade_score=cascade_score,
+    )
     y_test = splits.test_all["binary_label"].to_numpy()
     rf_pred = (test_scores > rf_model.threshold).astype(int)
     conformal_pred = (test_pvals <= alpha_conformal).astype(int)
@@ -418,7 +571,12 @@ if __name__ == "__main__":
     parser.add_argument("--alpha-conformal", type=float, default=0.05)
     parser.add_argument("--alpha-escalate", type=float, default=0.20)
     parser.add_argument("--gate-threshold", type=float, default=0.5)
-    parser.add_argument("--split-strategy", default="random", choices=["random", "temporal", "temporal_by_file"])
+    parser.add_argument(
+        "--split-strategy",
+        # Locked environment: temporal_by_file (day-level) split.
+        default="temporal_by_file",
+        choices=["random", "temporal", "temporal_by_file"],
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gate-max-iter", type=int, default=300)
     parser.add_argument("--calibration-fraction", type=float, default=0.50)
