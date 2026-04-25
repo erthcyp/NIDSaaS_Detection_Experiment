@@ -13,6 +13,21 @@ is the spine that links them together.
 
 ---
 
+> **Just want the detection numbers? Skip Docker and use
+> [`DETECTION_QUICKSTART.md`](DETECTION_QUICKSTART.md) instead.**
+>
+> The quickstart reproduces the paper's full detection experiment
+> (cascade + baselines + Snort) in **~4 hours on WSL2** — no Docker,
+> no live prototype. It walks you through the recommended file
+> placement (repo + CSVs on Windows fs, pcaps copied into WSL Linux
+> fs for native Snort speed) and links to the fast 1.5-hour path that
+> skips Snort entirely if needed.
+>
+> Run `bash scripts/precheck_detection.sh` first to confirm your
+> machine is set up correctly.
+
+---
+
 ## 0. What you will end up with
 
 When you finish the whole manual you will have:
@@ -400,3 +415,204 @@ it falls back to a conservative statistical scorer so the stack still
 runs end-to-end.
 
 ---
+
+## 11. Step 8 — Bring up the live prototype (Docker)
+
+### 8.1 Install Docker Desktop (Windows/macOS) or Docker Engine (Linux)
+
+- Windows: Docker Desktop + enable WSL2 integration with your Ubuntu
+  distro. See
+  https://docs.docker.com/desktop/install/windows-install/.
+- Linux: `sudo apt install docker-ce docker-ce-cli containerd.io docker-compose-plugin`
+  via Docker's official apt repo.
+
+Verify:
+
+```bash
+docker --version          # >= 24.0
+docker compose version    # v2+
+```
+
+### 8.2 Bring up the stack
+
+```bash
+cd prototype
+
+# First time only — build images (~10 min for the Snort sidecar)
+docker compose build
+
+# Start everything
+docker compose up -d
+
+# Verify all services came up healthy
+docker compose ps
+```
+
+### 8.3 Fire a synthetic attack and watch the alert fan out
+
+```bash
+./scripts/demo_attack.sh
+```
+
+Expected final output: a JSON alert body with `"tier": "tier1_rate"`
+and `"score": 1.0` — the Tier-1 rate rule path catching a synthetic
+SYN flood.
+
+Follow the alerts topic live:
+
+```bash
+docker exec -it nidsaas_kafka kafka-console-consumer.sh \
+    --bootstrap-server kafka:9092 \
+    --topic tenant.acme.alerts --from-beginning
+```
+
+Or query the in-memory receiver:
+
+```bash
+curl -s localhost:9000/alerts | jq 'to_entries[] | {t:.key, n:(.value|length)}'
+```
+
+### 8.4 (Optional) Switch to pcap mode — exercise the full Figure-1 pipeline
+
+CSV mode (default) POSTs pre-extracted flow rows straight to the
+detector. Pcap mode instead ships raw pcap bytes through the
+`flow_extractor` sidecar (CICFlowMeter v4), which is the path drawn in
+Figure 1 of the paper. Downstream of the raw topic the two modes are
+identical.
+
+```bash
+cd prototype
+
+# 8.4.1 flip the simulator to pcap mode (edit .env)
+sed -i 's/^SIM_MODE=csv/SIM_MODE=pcap/' .env
+
+# 8.4.2 build the CICFlowMeter sidecar (first time only: ~8 min)
+docker compose build flow_extractor
+
+# 8.4.3 restart the stack with pcap mode active
+docker compose down -v
+docker compose up -d
+
+# 8.4.4 follow extraction + detection
+docker compose logs -f flow_extractor detector
+```
+
+Expected log sequence:
+
+```
+[sim] SIM_MODE=pcap: using /ingest_pcap + flow_extractor path
+[gateway] 202 /ingest_pcap chunk_id=Monday-WorkingHours-00000 bytes=4982312
+[extractor] [acme] chunk=Monday-WorkingHours-00000 bytes=4982312 flows=1847 elapsed=4.3s
+[detector] ... tier=tier2_gate score=... decision=0|1
+```
+
+Knobs in `.env` if the default run is too slow / fast:
+
+| Var | Meaning |
+|---|---|
+| `SIM_PCAP_PACKETS_PER_CHUNK` | Packets per chunk (default 5000). |
+| `SIM_PCAP_MAX_CHUNKS_PER_FILE` | Cap so the demo finishes in minutes (default 40). |
+| `SIM_PCAP_CHUNK_GAP_SEC` | Gap between chunks (default 1.0s). |
+| `PCAP_CHUNK_MAX_BYTES` | Broker/topic/consumer message-size ceiling (default 16 MB). |
+
+Important caveats:
+
+- Pcap mode has **no ground-truth labels**. Alerts reflect detector
+  decisions only. Use CSV mode when you need label-based metrics.
+- CICFlowMeter feature names must match the RF training distribution.
+  Do not swap the extractor to nfstream / a custom port without
+  retraining the detector.
+- Per-tenant pcaps: drop captures under
+  `pcap_CIC_IDS2017/<tenant>/*.pcap` to give different tenants
+  different traffic. Otherwise all tenants share the same pcap menu.
+
+### 8.5 Teardown
+
+```bash
+docker compose down -v       # -v also drops the Kafka volume
+```
+
+Service-level details:
+- `prototype/README.md` (overall)
+- `prototype/gateway/README.md`
+- `prototype/streaming_worker/README.md`
+- `prototype/flow_extractor/README.md` *(pcap mode, CICFlowMeter v4)*
+- `prototype/snort_sidecar/README.md`
+- `prototype/tenant_simulator/README.md`
+- `prototype/alert_fanout/README.md`
+- `prototype/webhook_receiver/README.md`
+- `prototype/init/README.md`
+- `prototype/scripts/README.md`
+
+**Done when:** `demo_attack.sh` prints a JSON alert with `"tier":
+"tier1_rate"`, and `curl localhost:9000/alerts` returns non-empty
+buffers for all three tenants after the simulator finishes.
+
+---
+
+## 12. Quick-reference runbook
+
+Once you have done the full install once, day-to-day work looks like:
+
+```bash
+# edit a rate rule or gate hyperparameter, re-train fast using cached RF
+cd pipeline
+python3 hybrid_cascade_splitcal_fastsnort.py \
+    --rf-model outputs_proposed_locked_a20_g50/rf_anomaly.joblib \
+    --alpha-escalate 0.15 \
+    --output-dir outputs_experiment_a15
+
+# re-apply val calibration
+python3 proposed_method_valcal.py \
+    --scored outputs_experiment_a15/test_scores_with_predictions.csv \
+    --val-scored outputs_experiment_a15/val_scores_with_predictions.csv \
+    --output-dir outputs_experiment_a15_promoted
+
+# (optional) push new bundle to the prototype detector
+python3 cascade_export_patch.py \
+    --data-dir ../csv_CIC_IDS2017 \
+    --rf outputs_experiment_a15/rf_anomaly.joblib \
+    --conformal outputs_experiment_a15/conformal.joblib \
+    --gate outputs_experiment_a15/gate.joblib \
+    --tau-star "$(jq -r .tau_star outputs_experiment_a15_promoted/run_config.json)" \
+    --output ../prototype/models/gate.joblib
+
+cd ../prototype
+docker compose restart detector
+```
+
+---
+
+## 13. Troubleshooting index
+
+| Symptom | Where to look |
+|---|---|
+| `FileNotFoundError: ../csv_CIC_IDS2017/Monday-...csv` | You skipped Step 1 or the CSVs are in the wrong folder. File **names** must match exactly. |
+| Hybrid cascade runs OOM | Lower `--sample-benign` or close other apps; peak is ~10 GB. |
+| `outputs_*/test_scores_with_predictions.csv` empty | Split strategy produced an empty test fold. Check `--split-strategy temporal_by_file` is set and all 8 CSVs are present. |
+| Reused RF gives different numbers | You changed `--seed` or `--split-strategy`; RF cache is only valid under the same seed + split + data. See the cheat-sheet in `hybrid_cascade_splitcal_fastsnort.md`. |
+| Prototype `Image bitnami/kafka:3.7 not found` | Old compose file. Pull latest — it now uses `apache/kafka:3.9.0`. |
+| Docker Desktop "C:\ProgramData\DockerDesktop must be owned by an elevated account" | Uninstalled without admin rights. Delete `C:\ProgramData\DockerDesktop` and `C:\ProgramData\Docker` in an elevated PowerShell, then run Docker Desktop **as administrator** once. |
+| `demo_attack.sh` prints no alert | Check `docker compose logs detector` — likely `gate.joblib` is missing and the fallback scorer is running with a very strict τ\*. Re-run Step 7 or lower τ\* temporarily. |
+| Snort sidecar idle | No pcap directory for that tenant. Place a pcap at `pcap_CIC_IDS2017/<tenant>/<whatever>.pcap` and `docker compose restart snort_sidecar`. |
+| JWT "token expired" on `/ingest` | Client ran longer than the gateway's JWT TTL (default 1h). Re-POST to `/oauth/token` and retry. |
+
+---
+
+## 14. Paper deliverables map (what each step produces)
+
+| Paper deliverable | Produced by | Step |
+|---|---|---|
+| Main table: proposed (val-calibrated) row | `proposed_method_valcal.py` | 4.2 |
+| Sweep table: (α, calibration-fraction) grid | `hybrid_cascade_splitcal_fastsnort.py` × 4 | 4.1 |
+| Baselines table | `compare_anomaly_baselines_valcal.py` + `rf_baseline_valcal.py` + `rate_rules_baseline_valcal.py` | 5 |
+| Snort row | `snort_eval_fixed_v3_splitstrategy.py` | 3 |
+| Architecture figure services | Docker Compose stack under `prototype/` | 8 |
+| Threshold τ\* justification | `outputs_proposed_locked_rate_promoted/run_config.json` | 4.2 |
+| Rate-rule promotion justification | `outputs_rate_rules_baseline_valcal/` per-class breakdown | 5 |
+
+---
+
+**Stuck?** Each per-script / per-service manual has its own
+"Common problems" section that covers the 90% case. Fall back to this
+document only for cross-cutting setup issues.
